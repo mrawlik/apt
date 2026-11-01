@@ -1,0 +1,79 @@
+name: Publish
+
+# Rebuilds the whole repository from the latest release of each project in
+# projects.txt. Any error fails the run, and the previous deploy stays live.
+on:
+  workflow_dispatch: # called by each project's release workflow
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write # deploy to Pages
+  id-token: write # required by deploy-pages
+
+# Each run rebuilds everything, so the last queued run is always correct.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash # -eo pipefail
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Environment secrets are only visible to jobs that declare the environment.
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      KEY_FPR: 2F6E717BF5EA6699922253E2EDEF86CE783B2A0F
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site/pool/main
+          for name in $(< projects.txt); do
+            gh release download --repo "mrawlik/$name" --pattern "${name}_*.deb" --dir site/pool/main
+            # The filename can say anything; the package name inside must match.
+            for f in site/pool/main/"${name}"_*.deb; do
+              [ "$(dpkg-deb -f "$f" Package)" = "$name" ] || { echo "::error::$f is not package $name"; exit 1; }
+            done
+          done
+
+      - name: Build and sign the index
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --import <<< "$APT_SIGNING_KEY"
+          cd site
+          mkdir -p dists/stable/main/binary-amd64
+          # --arch keeps other architectures out of the amd64 index (by filename).
+          apt-ftparchive packages --arch amd64 pool > dists/stable/main/binary-amd64/Packages
+          gzip -9k dists/stable/main/binary-amd64/Packages
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=mrawlik \
+            -o APT::FTPArchive::Release::Label=mrawlik \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Components=main \
+            -o APT::FTPArchive::Release::Architectures=amd64 \
+            release dists/stable > Release
+          mv Release dists/stable/Release
+          # Pinned to the fingerprint: a wrong secret fails here instead of
+          # publishing a repo signed by a key users don't have.
+          gpg --batch --local-user "$KEY_FPR" --clearsign -o dists/stable/InRelease dists/stable/Release
+          gpg --export "$KEY_FPR" > mrawlik.gpg
+          cp ../index.html .
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v5
